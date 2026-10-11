@@ -149,7 +149,9 @@ test('a card saves a key the Bot never sees, and the shell gets it', async (t) =
   assert.match((await bench.call('secret-set', { requestId: request.id, value })).error.message, /already answered/)
 
   const file = join(bench.home, 'secrets.json')
-  assert.equal(statSync(file).mode & 0o777, 0o600)
+  // Windows chmod controls writability; these mode bits do not describe account ACLs.
+  if (process.platform === 'win32') assert.equal(statSync(file).mode & 0o200, 0o200)
+  else assert.equal(statSync(file).mode & 0o777, 0o600)
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).secrets[0].value, value)
   assert.deepEqual(readdirSync(bench.home).filter(name => name.endsWith('.tmp')), [])
   team = await bench.view()

@@ -13,19 +13,20 @@ const tempHome = (t) => {
   return home
 }
 
-test('the first host takes the lock and a second live host only reads', (t) => {
+test('the first host takes the lock and a second live host only reads', async (t) => {
   const path = join(tempHome(t), 'state.lock')
   const first = homeLock(path, { pid: 101, isAlive: () => true })
   const second = homeLock(path, { pid: 202, isAlive: () => true })
-  t.after(() => { first.release(); second.release() })
-  assert.equal(first.claim(), undefined)
-  assert.equal(first.owns(), true)
-  assert.equal(second.claim().pid, 101)
-  assert.equal(second.owns(), false)
-  first.release()
-  assert.equal(existsSync(path), false)
-  assert.equal(second.claim(), undefined)
-  assert.equal(second.owns(), true)
+  try {
+    assert.equal(first.claim(), undefined)
+    assert.equal(first.owns(), true)
+    assert.equal(second.claim().pid, 101)
+    assert.equal(second.owns(), false)
+    await first.release()
+    assert.equal(existsSync(path), false)
+    assert.equal(second.claim(), undefined)
+    assert.equal(second.owns(), true)
+  } finally { await first.release(); await second.release() }
 })
 
 test('a dead local holder or an expired remote holder is taken over', (t) => {
