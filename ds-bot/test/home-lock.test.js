@@ -28,7 +28,7 @@ test('the first host takes the lock and a second live host only reads', (t) => {
   assert.equal(second.owns(), true)
 })
 
-test('a lock whose process has exited, or that nobody keeps fresh, is taken over', (t) => {
+test('a dead local holder or an expired remote holder is taken over', (t) => {
   const path = join(tempHome(t), 'state.lock')
   writeFileSync(path, JSON.stringify({ pid: 101, host: hostname(), token: 'gone' }))
   const dead = homeLock(path, { pid: 202, isAlive: () => false })
@@ -37,8 +37,8 @@ test('a lock whose process has exited, or that nobody keeps fresh, is taken over
   assert.equal(dead.owns(), true)
   dead.release()
 
-  // A live pid (maybe reused) on a lock not bumped for staleMs, and a lock from another host.
-  writeFileSync(path, JSON.stringify({ pid: 101, host: hostname(), token: 'old' }))
+  // A remote host can only be checked by its heartbeat age.
+  writeFileSync(path, JSON.stringify({ pid: 101, host: 'elsewhere', token: 'old' }))
   const old = new Date(Date.now() - 120_000)
   utimesSync(path, old, old)
   const late = homeLock(path, { pid: 202, isAlive: () => true })

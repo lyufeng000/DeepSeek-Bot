@@ -4,6 +4,10 @@ All notable changes to DS Bot are listed here. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop state writes when the home lock cannot be acquired or maintained, check ownership through the final commit, and keep the lock until queued writes finish on shutdown.
+
 ## [0.1.0] - 2026-10-10
 
 The first public preview. Tested with DeepSeek Harness `0.2.1-alpha.1` (DSH Desktop and DSH Web).
