@@ -2,7 +2,7 @@
 // DSH mounts no exporter for ctx.logger once it has started, so warnings would otherwise
 // reach only stderr. Entries are kept in memory and in <home>/logs/diagnostics.jsonl, so
 // a report written after a restart still has them. Every text is cleaned of saved keys,
-// credential-like strings and the home folder before it is kept and again before it is
+// credential-like strings and the home folder before any log output and again before it is
 // shown, because the report is meant for a public issue.
 import { readFileSync } from 'node:fs'
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
@@ -144,7 +144,7 @@ export function install(rt) {
     }).catch((error) => {
       if (fileFailed) return
       fileFailed = true
-      console.error('[ds-bot] diagnostics log not written:', error?.code ?? error?.message ?? error)
+      console.error('[ds-bot] diagnostics log not written: %s', clean(error?.code ?? error?.message ?? error))
     })
   }
 
@@ -164,16 +164,17 @@ export function install(rt) {
   }
 
   const warn = (template, ...args) => {
-    ctx.logger.warn(template, ...args)
-    console.error(`[ds-bot] ${template}`, ...args.map(arg => arg?.stack ?? arg))
     const error = args.find(arg => arg instanceof Error)
-    note({
+    const entry = note({
       level: 'warn',
       source: 'host',
       text: format(template, ...args.map(arg => (arg instanceof Error ? errorText(arg) : arg))).replace(/^ds-bot: /, ''),
       code: typeof error?.code === 'string' ? error.code : undefined,
       stack: error?.stack,
     })
+    const message = `${entry.code ? `[${entry.code}] ` : ''}${entry.text}${entry.stack ? `\n${entry.stack}` : ''}`
+    ctx.logger.warn('ds-bot: %s', message)
+    console.error('[ds-bot] %s', message)
   }
 
   const entries = async () => {
