@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import fsSync, { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { hostname, tmpdir } from 'node:os'
@@ -41,8 +41,8 @@ function start(t, contents = JSON.stringify(TEAM), onWarning) {
   return { rt, home, statePath, warnings }
 }
 
-function mockIo(t, name, implementation) {
-  const method = t.mock.method(fs, name, implementation)
+function mockIo(t, name, implementation, target = fs) {
+  const method = t.mock.method(target, name, implementation)
   syncBuiltinESMExports()
   t.after(() => {
     method.mock.restore()
@@ -51,21 +51,22 @@ function mockIo(t, name, implementation) {
   return method
 }
 
-for (const [operation, code] of [['mkdir', 'EACCES'], ['writeFile', 'ENOSPC'], ['rename', 'EPERM']]) {
+for (const [operation, code] of [['mkdir', 'EACCES'], ['writeFile', 'ENOSPC'], ['renameSync', 'EPERM']]) {
   test(`a failed ${operation} rejects its save, preserves the file and lets the next save succeed`, async (t) => {
     const { rt, home, statePath, warnings } = start(t)
     await rt.load()
     const before = readFileSync(statePath, 'utf8')
     const fault = Object.assign(new Error(`mock ${operation} failure`), { code })
-    const original = fs[operation]
+    const target = operation === 'renameSync' ? fsSync : fs
+    const original = target[operation]
     let fail = true
-    mockIo(t, operation, async (...args) => {
+    mockIo(t, operation, (...args) => {
       if (fail) {
         fail = false
         throw fault
       }
       return original(...args)
-    })
+    }, target)
     rt.state.prefs.theme = 'dark'
     await assert.rejects(rt.save(), error => error === fault)
     assert.equal(readFileSync(statePath, 'utf8'), before)
@@ -125,13 +126,13 @@ test('an already queued save survives an earlier failure and keeps its own snaps
 test('successful queued saves advance the revision only after each rename', async (t) => {
   const { rt, statePath } = start(t)
   await rt.load()
-  const original = fs.rename
+  const original = fsSync.renameSync
   const revisions = []
-  mockIo(t, 'rename', async (...args) => {
+  mockIo(t, 'renameSync', (...args) => {
     const snapshot = JSON.parse(readFileSync(args[0], 'utf8'))
     revisions.push([rt.state.revision, snapshot.revision])
     return original(...args)
-  })
+  }, fsSync)
   rt.state.prefs.theme = 'dark'
   const first = rt.save()
   rt.state.prefs.theme = 'paper'
@@ -221,15 +222,15 @@ test('a migration save failure is reported and a later load can retry it', async
   const contents = JSON.stringify({ ...TEAM, prefs: { theme: 'grok' } })
   const { rt, statePath } = start(t, contents)
   const fault = Object.assign(new Error('mock migration rename failure'), { code: 'EPERM' })
-  const original = fs.rename
+  const original = fsSync.renameSync
   let fail = true
-  mockIo(t, 'rename', async (...args) => {
+  mockIo(t, 'renameSync', (...args) => {
     if (fail) {
       fail = false
       throw fault
     }
     return original(...args)
-  })
+  }, fsSync)
   await assert.rejects(rt.load(), error => error === fault)
   assert.equal(readFileSync(statePath, 'utf8'), contents)
   assert.equal(rt.state.revision, TEAM.revision)

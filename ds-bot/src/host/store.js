@@ -1,8 +1,8 @@
 // Store: the saved team (state.json), its migrations, the lock that keeps a second dsh
 // host on the same data from writing it, and the indexes that map a Session to the Bot
 // or group chat it belongs to.
-import { mkdirSync, statSync } from 'node:fs'
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdirSync, renameSync, statSync } from 'node:fs'
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LEGACY_THEMES, MAX_EXCHANGES, ROOM_MODES } from './constants.js'
 import { homeLock } from './home-lock.js'
@@ -17,6 +17,9 @@ export function install(rt) {
   let writing = Promise.resolve()
   let stateReadError
   let hadStateFile = false
+  let pending = 0
+  let closing = false
+  let disposing
   const { warn } = rt
 
   const EMPTY = JSON.stringify(state)
@@ -36,19 +39,32 @@ export function install(rt) {
     }
   }
   const lock = homeLock(join(home, 'state.lock'))
+  const breakLock = (error) => {
+    lockBroken = true
+    holder = {}
+    warn('ds-bot: cannot lock %s; the Bot team is read-only: %s', home, error)
+  }
   const claimLock = () => {
-    if (lockBroken) return
+    if (closing || lockBroken) return
     try {
       mkdirSync(home, { recursive: true })
       holder = lock.claim()
     } catch (error) {
-      // An unusable lock (a read-only or odd file system) must not stop the team.
-      lockBroken = true
-      holder = undefined
-      warn('ds-bot: cannot lock %s, so another dsh on the same data could undo changes: %s', home, error)
+      breakLock(error)
     }
   }
+  const ownsLock = () => {
+    if (lockBroken) return false
+    try {
+      if (lock.owns()) return true
+      holder = lock.read() ?? {}
+    } catch (error) { breakLock(error) }
+    return false
+  }
   const readOnly = () => {
+    if (closing) return `The Bot team in ${home} is closing and cannot accept changes.`
+    if (holder === undefined) ownsLock()
+    if (lockBroken || holder?.guardBusy) return `The Bot team in ${home} cannot safely lock its data. This window cannot change it; close the dsh hosts, check the data directory and reload.`
     if (holder === undefined) return undefined
     const where = holder.pid ? `pid ${holder.pid}${holder.host ? ` on ${holder.host}` : ''}` : 'unknown process'
     return `The Bot team in ${home} is open in another dsh (Web or Desktop, ${where}). This window shows the team but cannot change it; close the other one and reload.`
@@ -154,9 +170,9 @@ export function install(rt) {
     if (loaded !== null) return loaded
     const job = (async () => {
       claimLock()
-      if (holder !== undefined) warn('ds-bot: %s', readOnly())
+      if (readOnly() !== undefined) warn('ds-bot: %s', readOnly())
       const { migrated, stale } = await readState()
-      if (holder !== undefined) return
+      if (readOnly() !== undefined) return
       if (migrated) await save()
       // Not awaited: renaming a session must not hold up the first roster read.
       for (const room of stale) void rt.retitleRoom(room)
@@ -170,12 +186,13 @@ export function install(rt) {
   // A reading host follows the file and takes over once the other host has gone.
   const refresh = async () => {
     await load()
-    if (holder === undefined) {
+    if (closing) return
+    if (holder === undefined && ownsLock()) {
       if (stateReadError !== undefined) await readState()
       return
     }
     claimLock()
-    if (holder === undefined) {
+    if (!lockBroken && holder === undefined) {
       warn('ds-bot: the other dsh has closed; this one now saves the Bot team')
       warnedReadOnly = false
       await readState()
@@ -185,14 +202,7 @@ export function install(rt) {
   }
 
   const writable = () => {
-    if (lockBroken) return true
-    if (holder === undefined && lock.owns()) return true
-    // Lost the lock: retake it when nobody else holds it (its file was deleted), else
-    // another host took it over and this one stops writing.
-    if (holder === undefined) {
-      claimLock()
-      if (holder === undefined) return true
-    }
+    if (!closing && holder === undefined && ownsLock()) return true
     if (!warnedReadOnly) {
       warnedReadOnly = true
       warn('ds-bot: not saving the Bot team: %s', readOnly())
@@ -212,24 +222,34 @@ export function install(rt) {
     if (!writable()) return writing
     state.exchanges = state.exchanges.slice(-MAX_EXCHANGES)
     const snapshot = JSON.parse(JSON.stringify(state))
+    const lease = lock.lease()
+    pending += 1
     const job = writing.then(async () => {
       if (stateReadError !== undefined) throw stateReadError
+      const lost = () => Object.assign(new Error('Cannot save the Bot team after its state lock ownership changed.'), { code: 'DS_BOT_LOCK_LOST' })
+      if (!ownsLock() || lock.lease() !== lease) throw lost()
       // Only successful replacements advance the revision, including queued saves.
       snapshot.revision = state.revision + 1
       await mkdir(home, { recursive: true })
-      const temp = `${statePath}.${process.pid}.tmp`
+      const temp = `${statePath}.${process.pid}.${lease}.tmp`
       try {
         await writeFile(temp, JSON.stringify(snapshot, null, 2), 'utf8')
         if (stateReadError !== undefined) throw stateReadError
-        await rename(temp, statePath)
-      } catch (error) {
-        await unlink(temp).catch(() => {})
-        throw error
+        if (!await lock.commit(lease, () => {
+          renameSync(temp, statePath)
+          state.revision = snapshot.revision
+          hadStateFile = true
+          seen = stamp()
+        })) {
+          ownsLock()
+          throw lost()
+        }
+      } finally {
+        await unlink(temp).catch(error => {
+          if (error?.code !== 'ENOENT') warn('ds-bot: state temporary file cleanup failed: %s', error)
+        })
       }
-      state.revision = snapshot.revision
-      hadStateFile = true
-      seen = stamp()
-    })
+    }).finally(() => { pending -= 1 })
     // Recover the queue without turning this job's rejection into success.
     writing = job.catch(error => {
       try { warn('ds-bot: state write failed: %s', error) } catch {}
@@ -237,7 +257,16 @@ export function install(rt) {
     return job
   }
 
-  ctx.effect(() => () => lock.release(), 'ds-bot: state lock')
+  const releaseLock = () => {
+    const failed = error => warn('ds-bot: state lock release failed: %s', error)
+    try { return lock.release()?.catch(failed) } catch (error) { failed(error) }
+  }
+  ctx.effect(() => () => {
+    if (closing) return disposing
+    closing = true
+    if (pending === 0) return disposing = releaseLock()
+    return disposing = writing.finally(releaseLock)
+  }, 'ds-bot: state lock')
 
   const botOf = id => (id === undefined ? undefined : state.bots[id])
   const roomOf = id => (id === undefined ? undefined : state.rooms[id])
