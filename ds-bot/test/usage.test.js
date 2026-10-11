@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { format } from 'node:util'
 import { apply } from '../index.js'
 import { foldCalls } from '../src/host/usage.js'
 import { fakeContext } from './fake-ctx.js'
@@ -220,7 +221,8 @@ test('a subagent Session is read through its parent, even a parent that is gone;
   assert.equal(totals(view)['other/chat'], 44 + 9)
   // No parent on record: it cannot be addressed, so it is not asked for.
   assert.ok(!pages.includes('s-lost'))
-  const unread = () => warnings.filter(([template]) => template.includes('usage could not read')).map(([, sessionId]) => sessionId)
+  const unread = () => warnings.map(args => format(...args))
+    .flatMap(text => /^ds-bot: usage could not read ([^:]+):/.exec(text)?.slice(1) ?? [])
   assert.deepEqual(unread(), ['s-broken'])
 
   t.mock.timers.tick(60_000)
