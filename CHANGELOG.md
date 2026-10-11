@@ -4,6 +4,10 @@ All notable changes to DS Bot are listed here. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- Report failed team-state saves, retry later saves, and advance the revision only after the file is replaced. Preserve unreadable or incompatible state files until they are restored.
+
 ## [0.1.0] - 2026-10-10
 
 The first public preview. Tested with DeepSeek Harness `0.2.1-alpha.1` (DSH Desktop and DSH Web).

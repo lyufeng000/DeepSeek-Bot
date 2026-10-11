@@ -2,7 +2,7 @@
 // host on the same data from writing it, and the indexes that map a Session to the Bot
 // or group chat it belongs to.
 import { mkdirSync, statSync } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LEGACY_THEMES, MAX_EXCHANGES, ROOM_MODES } from './constants.js'
 import { homeLock } from './home-lock.js'
@@ -15,6 +15,8 @@ export function install(rt) {
   const state = { version: 1, mainBotIds: [], bots: {}, rooms: {}, agents: {}, exchanges: [], exchangeTurns: {}, questions: {}, prefs: {}, revision: 0 }
   let loaded = null
   let writing = Promise.resolve()
+  let stateReadError
+  let hadStateFile = false
   const { warn } = rt
 
   const EMPTY = JSON.stringify(state)
@@ -54,12 +56,25 @@ export function install(rt) {
 
   const readFileState = async () => {
     try {
-      seen = stamp()
-      const parsed = JSON.parse(await readFile(statePath, 'utf8'))
-      return parsed?.version === 1 ? parsed : undefined
+      // A replacement during the read must still be noticed by the next refresh.
+      const nextSeen = stamp()
+      const contents = await readFile(statePath, 'utf8')
+      hadStateFile = true
+      const parsed = JSON.parse(contents)
+      if (parsed?.version !== 1) throw Object.assign(new Error('Unsupported Bot team state version; restore a compatible state.json before saving.'), { code: 'bot/state-version' })
+      if (parsed.revision !== undefined && (!Number.isSafeInteger(parsed.revision) || parsed.revision < 0)) throw Object.assign(new Error('Invalid Bot team state revision; restore a valid state.json before saving.'), { code: 'bot/state-invalid' })
+      seen = nextSeen
+      stateReadError = undefined
+      return parsed
     } catch (error) {
-      if (error?.code !== 'ENOENT') warn('ds-bot: unreadable state %s: %s', statePath, error)
-      return undefined
+      if (error?.code === 'ENOENT' && !hadStateFile) {
+        seen = ''
+        stateReadError = undefined
+        return undefined
+      }
+      stateReadError = error
+      warn('ds-bot: unreadable state %s: %s', statePath, error)
+      throw error
     }
   }
 
@@ -124,28 +139,49 @@ export function install(rt) {
     return { migrated: migrated || stale.length > 0, stale }
   }
 
-  const load = () => loaded ??= (async () => {
-    claimLock()
-    if (holder !== undefined) warn('ds-bot: %s', readOnly())
-    const { migrated, stale } = adopt(await readFileState())
-    if (holder !== undefined) return
-    if (migrated) await save()
-    // Not awaited: renaming a session must not hold up the first roster read.
-    for (const room of stale) void rt.retitleRoom(room)
-  })()
+  const readState = async () => {
+    const parsed = await readFileState()
+    try {
+      return adopt(parsed)
+    } catch (error) {
+      stateReadError = error
+      warn('ds-bot: invalid state %s: %s', statePath, error)
+      throw error
+    }
+  }
+
+  const load = () => {
+    if (loaded !== null) return loaded
+    const job = (async () => {
+      claimLock()
+      if (holder !== undefined) warn('ds-bot: %s', readOnly())
+      const { migrated, stale } = await readState()
+      if (holder !== undefined) return
+      if (migrated) await save()
+      // Not awaited: renaming a session must not hold up the first roster read.
+      for (const room of stale) void rt.retitleRoom(room)
+    })()
+    loaded = job
+    // Startup also loads in the background; callers that await still get the error.
+    void job.catch(() => { if (loaded === job) loaded = null })
+    return job
+  }
 
   // A reading host follows the file and takes over once the other host has gone.
   const refresh = async () => {
     await load()
-    if (holder === undefined) return
+    if (holder === undefined) {
+      if (stateReadError !== undefined) await readState()
+      return
+    }
     claimLock()
     if (holder === undefined) {
       warn('ds-bot: the other dsh has closed; this one now saves the Bot team')
       warnedReadOnly = false
-      adopt(await readFileState())
+      await readState()
       return
     }
-    if (stamp() !== seen) adopt(await readFileState())
+    if (stateReadError !== undefined || stamp() !== seen) await readState()
   }
 
   const writable = () => {
@@ -165,20 +201,40 @@ export function install(rt) {
   }
 
   const save = () => {
+    if (stateReadError !== undefined) {
+      const job = Promise.reject(stateReadError)
+      // Turn listeners also save without awaiting; the read failure was already logged.
+      void job.catch(() => {})
+      return job
+    }
     indexSessions()
     // A reading host keeps the file's revision, so its window does not skip the next change.
     if (!writable()) return writing
-    state.revision += 1
     state.exchanges = state.exchanges.slice(-MAX_EXCHANGES)
-    const snapshot = JSON.stringify(state, null, 2)
-    writing = writing.then(async () => {
+    const snapshot = JSON.parse(JSON.stringify(state))
+    const job = writing.then(async () => {
+      if (stateReadError !== undefined) throw stateReadError
+      // Only successful replacements advance the revision, including queued saves.
+      snapshot.revision = state.revision + 1
       await mkdir(home, { recursive: true })
       const temp = `${statePath}.${process.pid}.tmp`
-      await writeFile(temp, snapshot, 'utf8')
-      await rename(temp, statePath)
+      try {
+        await writeFile(temp, JSON.stringify(snapshot, null, 2), 'utf8')
+        if (stateReadError !== undefined) throw stateReadError
+        await rename(temp, statePath)
+      } catch (error) {
+        await unlink(temp).catch(() => {})
+        throw error
+      }
+      state.revision = snapshot.revision
+      hadStateFile = true
       seen = stamp()
-    }).catch(error => { warn('ds-bot: state write failed: %s', error) })
-    return writing
+    })
+    // Recover the queue without turning this job's rejection into success.
+    writing = job.catch(error => {
+      try { warn('ds-bot: state write failed: %s', error) } catch {}
+    })
+    return job
   }
 
   ctx.effect(() => () => lock.release(), 'ds-bot: state lock')
