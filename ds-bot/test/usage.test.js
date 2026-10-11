@@ -47,7 +47,7 @@ test('a fork does not count the calls it inherited from its parent', () => {
 const HOUR = 3_600_000
 const LONG_AGO = 1_000
 
-function start(home, { listedExtra, logsExtra } = {}) {
+function start(home, { listedExtra, logsExtra, subagentsExtra } = {}) {
   const fresh = home === undefined
   home ??= mkdtempSync(join(tmpdir(), 'ds-bot-usage-'))
   if (fresh) writeFileSync(join(home, 'state.json'), JSON.stringify({
@@ -75,19 +75,27 @@ function start(home, { listedExtra, logsExtra } = {}) {
     ...logsExtra,
   }
   for (const log of Object.values(logs)) log.forEach((event, seq) => { event.seq = seq })
+  // Child Session → the parent its header names, as DSH checks a page address.
+  const subagents = { 's-sub': 's-b1', ...subagentsExtra }
   const pages = []
+  const warnings = []
   const ctx = fakeContext()
+  ctx.logger.warn = (template, ...args) => warnings.push([template, ...args])
   ctx.sessionController = {
     list: async () => ({ items: [
       { sessionId: 's-x', projections: { kind: 'cached', asOfSeq: 1, values: {} } },
-      { sessionId: 's-sub', parentSessionId: 's-b1', projections: { kind: 'cached', asOfSeq: 1, values: {} } },
+      { sessionId: 's-sub', parentSessionId: 's-b1', origin: 'subagent', projections: { kind: 'cached', asOfSeq: 1, values: {} } },
       { sessionId: 's-empty', blank: true },
       ...(listedExtra ?? []),
     ] }),
     projections: async ({ sessionId }) => (logs[sessionId] ? { asOfSeq: logs[sessionId].length - 1, values: {} } : null),
     page: async ({ address, throughSeq, beforeSeq }) => {
-      pages.push(address.sessionId)
-      const events = logs[address.sessionId].filter(event => event.seq <= throughSeq && (beforeSeq === undefined || event.seq < beforeSeq))
+      const sessionId = address.kind === 'session' ? address.sessionId : address.childSessionId
+      if (address.kind === 'session' && sessionId in subagents) throw new Error('subagent Sessions require their durable parent address')
+      if (address.kind === 'subagent' && subagents[sessionId] !== address.parentSessionId) throw new Error('subagent does not belong to the supplied parent')
+      if (logs[sessionId] === undefined) throw new Error(`no log for ${sessionId}`)
+      pages.push(sessionId)
+      const events = logs[sessionId].filter(event => event.seq <= throughSeq && (beforeSeq === undefined || event.seq < beforeSeq))
       return { records: events.map(event => ({ event })), hasMore: false }
     },
   }
@@ -103,7 +111,7 @@ function start(home, { listedExtra, logsExtra } = {}) {
     ctx.dispose()
     rmSync(home, { recursive: true, force: true })
   }
-  return { call, ctx, home, meter, pages, stop }
+  return { call, ctx, home, meter, pages, stop, warnings }
 }
 
 // Total tokens per owner name and use.
@@ -190,4 +198,33 @@ test('a plain chat journals its owner before the first scan, so a deleted Bot ke
   const view = (await second.call('usage', { timeZone: 'Asia/Shanghai' })).value
   assert.equal(totals(view)['Writer/chat'], 55)
   second.ctx.dispose()
+})
+
+test('a subagent Session is read through its parent, even a parent that is gone; one that cannot be read warns once', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 10 * HOUR })
+  const { call, pages, stop, warnings } = start(undefined, {
+    listedExtra: [
+      { sessionId: 's-orphan', parentSessionId: 's-gone', origin: 'subagent', projections: { kind: 'cached', asOfSeq: 1, values: {} } },
+      { sessionId: 's-lost', origin: 'subagent', projections: { kind: 'cached', asOfSeq: 1, values: {} } },
+      { sessionId: 's-broken', projections: { kind: 'cached', asOfSeq: 1, values: {} } },
+    ],
+    logsExtra: {
+      's-orphan': [header('deepseek', 'v4-flash'), message(1, 0, usage(8, 1), HOUR)],
+      's-lost': [header('deepseek', 'v4-flash'), message(1, 0, usage(9, 9), HOUR)],
+    },
+    subagentsExtra: { 's-orphan': 's-gone', 's-lost': 's-gone' },
+  })
+  t.after(stop)
+  const view = (await call('usage', { timeZone: 'Asia/Shanghai' })).value
+  assert.equal(totals(view)['Chief/chat'], 160 + 220 + 10)
+  assert.equal(totals(view)['other/chat'], 44 + 9)
+  // No parent on record: it cannot be addressed, so it is not asked for.
+  assert.ok(!pages.includes('s-lost'))
+  const unread = () => warnings.filter(([template]) => template.includes('usage could not read')).map(([, sessionId]) => sessionId)
+  assert.deepEqual(unread(), ['s-broken'])
+
+  t.mock.timers.tick(60_000)
+  await call('usage', { timeZone: 'Asia/Shanghai' })
+  assert.equal(pages.filter(sessionId => sessionId === 's-orphan').length, 1)
+  assert.deepEqual(unread(), ['s-broken'])
 })

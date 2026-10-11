@@ -9,6 +9,7 @@ All notable changes to DS Bot are listed here. The format follows [Keep a Change
 - Report failed team-state saves, retry later saves, and advance the revision only after the file is replaced. Preserve unreadable or incompatible state files until they are restored.
 - Stop state writes when the home lock cannot be acquired or maintained, check ownership through the final commit, and keep the lock until queued writes finish on shutdown.
 - Redact warnings before sending them to the host logger, stderr and diagnostics files.
+- Group the first model choices by provider, so models with the same name can be distinguished. Providers with the same display name also show their provider IDs.
 
 ## [0.1.0] - 2026-10-10
 

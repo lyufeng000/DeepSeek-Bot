@@ -320,7 +320,18 @@ export function install(rt) {
     ...Object.values(room.segments ?? {}).flat().map(segment => segment.sessionId),
   ]))
 
-  async function scanSession(ledger, sessionId, asOfSeq, sealable, signal) {
+  // DSH reads a subagent Session only through its parent's address; the parent
+  // need not exist any more. One with no parent on record cannot be read.
+  const addressOf = item => (item.origin !== 'subagent'
+    ? { kind: 'session', sessionId: item.sessionId }
+    : item.parentSessionId === undefined
+      ? undefined
+      : { kind: 'subagent', parentSessionId: item.parentSessionId, childSessionId: item.sessionId, mode: 'unknown' })
+  // Sessions that already failed to read, so each one warns once, not every scan.
+  const unreadable = new Set()
+
+  async function scanSession(ledger, address, asOfSeq, sealable, signal) {
+    const sessionId = address.kind === 'session' ? address.sessionId : address.childSessionId
     const mark = ledger.mark(sessionId)
     if (mark?.sealed) return
     let through = asOfSeq
@@ -338,7 +349,7 @@ export function install(rt) {
     let beforeSeq
     for (let reached = false; !reached;) {
       const page = await ctx.sessionController.page({
-        address: { kind: 'session', sessionId },
+        address,
         throughSeq: through,
         ...(beforeSeq === undefined ? {} : { beforeSeq }),
         maxMessages: PAGE_MESSAGES,
@@ -397,8 +408,19 @@ export function install(rt) {
       const targets = new Map()
       for (const item of listed) if (item.blank !== true) targets.set(item.sessionId, item.projections?.asOfSeq)
       for (const sessionId of owners.keys()) if (!targets.has(sessionId)) targets.set(sessionId, undefined)
-      await eachLimited([...targets], SCAN_PARALLEL, ([sessionId, asOfSeq]) => scanSession(ledger, sessionId, asOfSeq, ended.has(sessionId), signal)
-        .catch(error => rt.warn('ds-bot: usage could not read %s: %s', sessionId, error)))
+      const addresses = new Map(listed.map(item => [item.sessionId, addressOf(item)]))
+      await eachLimited([...targets], SCAN_PARALLEL, async ([sessionId, asOfSeq]) => {
+        const address = addresses.has(sessionId) ? addresses.get(sessionId) : { kind: 'session', sessionId }
+        if (address === undefined) return
+        try {
+          await scanSession(ledger, address, asOfSeq, ended.has(sessionId), signal)
+          unreadable.delete(sessionId)
+        } catch (error) {
+          if (unreadable.has(sessionId)) return
+          unreadable.add(sessionId)
+          rt.warn('ds-bot: usage could not read %s: %s', sessionId, error)
+        }
+      })
     })().finally(() => {
       scannedAt = Date.now()
       scanning = undefined

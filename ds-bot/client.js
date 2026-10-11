@@ -5680,10 +5680,19 @@ var MENU_EXIT_MS = 120;
 function groupModels(models) {
   const groups = /* @__PURE__ */ new Map();
   for (const model of models ?? []) {
-    if (!groups.has(model.providerName)) groups.set(model.providerName, []);
-    groups.get(model.providerName).push(model);
+    const provider = model.provider ?? model.providerName ?? model.ref.split("/")[0];
+    if (!groups.has(provider)) groups.set(provider, []);
+    groups.get(provider).push(model);
   }
-  return [...groups];
+  const names = /* @__PURE__ */ new Map();
+  for (const [provider, list] of groups) {
+    const name = list[0].providerName ?? provider;
+    names.set(name, (names.get(name) ?? 0) + 1);
+  }
+  return [...groups].map(([provider, list]) => {
+    const name = list[0].providerName ?? provider;
+    return [names.get(name) > 1 ? `${name} (${provider})` : name, list];
+  });
 }
 var servedOf = (roster, ref) => (roster.models ?? []).find((model) => model.ref === ref);
 function modelOf(bot, roster) {
@@ -5696,7 +5705,7 @@ function modelOf(bot, roster) {
 function ModelRows({ roster, current, onPick }) {
   return groupModels(roster.models).map(([provider, list]) => (0, import_react13.createElement)(
     import_react13.Fragment,
-    { key: provider },
+    { key: list[0].provider ?? provider },
     (0, import_react13.createElement)("div", { className: "bt-model-group", role: "presentation" }, provider),
     list.map((model) => (0, import_react13.createElement)(
       "button",
@@ -5824,15 +5833,21 @@ function ModelChoiceDock({ sessionId, useRoster, actions }) {
   };
   const text = lost ? t("{model} is not available anymore. Pick another model for me.", { model: bot.model.split("/").slice(1).join("/") }) : models.length === 0 ? t("Hi, I'm {name}. I don't have a model yet. How do you want to set one up?", { name: bot.name }) : t("Hi, I'm {name}. Pick a model for me first. You can change it later in my details.", { name: bot.name });
   const choices = models.length === 0 ? setupChoices(actions).map(([label, run]) => (0, import_react13.createElement)("button", { key: label, type: "button", className: "bt-model-chip", onClick: run }, label)) : [
-    ...models.map((model) => (0, import_react13.createElement)("button", {
-      key: model.ref,
-      type: "button",
-      className: "bt-model-chip",
-      disabled: busy !== "",
-      "aria-busy": busy === model.ref || void 0,
-      title: model.ref === roster.defaultModel ? `${model.ref} · ${t("Harness default")}` : model.ref,
-      onClick: () => pick2(model.ref)
-    }, model.name, busy === model.ref ? (0, import_react13.createElement)("span", { className: "bt-model-spin", "aria-label": t("Saving…") }) : null)),
+    ...groupModels(models).map(([provider, list]) => (0, import_react13.createElement)(
+      "div",
+      { key: list[0].provider ?? provider, className: "bt-model-choice-group", role: "group", "aria-label": provider },
+      (0, import_react13.createElement)("div", { className: "bt-model-choice-provider", "aria-hidden": true }, provider),
+      (0, import_react13.createElement)("div", { className: "bt-model-choice-chips" }, list.map((model) => (0, import_react13.createElement)("button", {
+        key: model.ref,
+        type: "button",
+        className: "bt-model-chip",
+        disabled: busy !== "",
+        "aria-busy": busy === model.ref || void 0,
+        "aria-label": `${model.name} · ${provider}`,
+        title: model.ref === roster.defaultModel ? `${model.ref} · ${t("Harness default")}` : model.ref,
+        onClick: () => pick2(model.ref)
+      }, model.name, busy === model.ref ? (0, import_react13.createElement)("span", { className: "bt-model-spin", "aria-label": t("Saving…") }) : null)))
+    )),
     (0, import_react13.createElement)("button", { key: "manage", type: "button", className: "bt-model-chip bt-model-chip-quiet", onClick: openHarnessSettings }, (0, import_react13.createElement)(SlidersIcon), t("Manage models"))
   ];
   return (0, import_react13.createElement)(
@@ -5905,6 +5920,9 @@ var MODEL_CSS = `
 .bt-model-none{padding:8px;font-size:13px;line-height:18px;color:var(--bt-ink-2)}
 .bt-model-dock{width:100%;max-width:var(--dsh-chat-content-width,748px);margin:0 auto;display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:0 0 10px;box-sizing:border-box;animation:bt-model-in ${SPRING_POP.duration}ms ${SPRING_POP.easing} backwards}
 .bt-model-chips{display:flex;flex-wrap:wrap;gap:6px;margin-left:30px;max-width:min(560px,calc(100% - 30px));max-height:min(240px,36vh);overflow-y:auto;scrollbar-width:thin}
+.bt-model-choice-group{display:flex;flex-direction:column;gap:6px;width:100%;min-width:0}
+.bt-model-choice-provider{padding-top:4px;font-size:12px;line-height:16px;font-weight:500;color:var(--bt-ink-2);overflow-wrap:anywhere}
+.bt-model-choice-chips{display:flex;flex-wrap:wrap;gap:6px}
 .bt-model-chip{display:inline-flex;align-items:center;gap:6px;min-height:30px;padding:5px 12px;border:.5px solid var(--bt-line-2);border-radius:999px;background:var(--bt-surface,transparent);color:var(--bt-ink);font:inherit;font-size:13px;line-height:18px;cursor:pointer;transition:background-color .12s ease,border-color .12s ease}
 .bt-model-chip:hover:not(:disabled){background:var(--bt-hover)}
 .bt-model-chip:focus-visible{outline:2px solid var(--bt-accent);outline-offset:1px}
